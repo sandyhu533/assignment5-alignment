@@ -281,6 +281,10 @@ def run_seed(args, seed: int, run_dir: str) -> str:
     # Per-phase timing accumulators (seconds).
     t_rollout = t_update = t_sync = t_eval = 0.0
 
+    # Record allocation history (with stacks) so an OOM can be dumped + visualized.
+    if args.debug_memory:
+        torch.cuda.memory._record_memory_history(max_entries=100_000)
+
     # --- GRPO training loop ---
     print(f"[seed {seed}][{elapsed()}] starting GRPO training loop ({args.num_rollout_steps} steps)...")
     for step in range(1, args.num_rollout_steps + 1):
@@ -311,16 +315,26 @@ def run_seed(args, seed: int, run_dir: str) -> str:
 
         # 3) POLICY UPDATE.
         t0 = time.perf_counter()
-        loss, train_metadata = sft.grpo_train_step(
-            model, tokenizer, optimizer,
-            args.gradient_accumulation_steps,
-            args.max_grad_norm,
-            reward_fn,
-            repeated_prompts,
-            rollout_responses,
-            repeated_ground_truths,
-            args.group_size,
-        )
+        try:
+            loss, train_metadata = sft.grpo_train_step(
+                model, tokenizer, optimizer,
+                args.gradient_accumulation_steps,
+                args.max_grad_norm,
+                reward_fn,
+                repeated_prompts,
+                rollout_responses,
+                repeated_ground_truths,
+                args.group_size,
+                debug_memory=args.debug_memory,
+            )
+        except torch.cuda.OutOfMemoryError:
+            # Dump the allocation history (with Python stacks) at the moment of OOM
+            # so it can be loaded into https://pytorch.org/memory_viz.
+            if args.debug_memory:
+                snap_path = os.path.join(run_dir, "oom_snapshot.pickle")
+                torch.cuda.memory._dump_snapshot(snap_path)
+                print(f"[seed {seed}][step {step}] CUDA OOM -> dumped snapshot to {snap_path}")
+            raise
         t_update += time.perf_counter() - t0
 
         step_time = time.perf_counter() - step_start
@@ -374,6 +388,9 @@ def run_seed(args, seed: int, run_dir: str) -> str:
         "t_weight_sync_s": t_sync,
         "t_eval_s": t_eval,
     })
+
+    if args.debug_memory:
+        torch.cuda.memory._record_memory_history(enabled=None)
 
     if server is not None:
         server.stop()
@@ -523,6 +540,8 @@ if __name__ == "__main__":
     # Debug
     parser.add_argument("--debug-no-vllm", action="store_true",
                         help="Skip vLLM server + NCCL + eval; use dummy rollouts to debug backward/optimizer.")
+    parser.add_argument("--debug-memory", action="store_true",
+                        help="Print per-microbatch GPU alloc and dump a memory snapshot (memory_viz pickle) on OOM.")
     # Logging / eval cadence
     parser.add_argument("--eval-interval", type=int, default=10)
     parser.add_argument("--print-interval", type=int, default=1)

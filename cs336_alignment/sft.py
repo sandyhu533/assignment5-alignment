@@ -165,6 +165,8 @@ def grpo_train_step(
     # Loss normalization
     loss_normalization: Literal["sequence", "constant"] = "sequence",
     normalization_constant: int | None = None,
+    # Debugging
+    debug_memory: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
     
     device = next(model.parameters()).device
@@ -216,6 +218,15 @@ def grpo_train_step(
             loss *= (len(input_ids_b) / len(input_ids))
         total_loss += loss.detach()
         loss.backward()
+
+        if debug_memory:
+            # Healthy: alloc stays flat across microbatches. Monotonic climb =>
+            # something is retaining the per-microbatch autograd graph (a leak).
+            mb_idx = i // microbatch_size
+            print(
+                f"    [mb {mb_idx}] alloc={torch.cuda.memory_allocated(device)/1024**3:.2f}GB "
+                f"reserved={torch.cuda.memory_reserved(device)/1024**3:.2f}GB"
+            )
 
     peak_mem_gb = torch.cuda.max_memory_allocated(device) / 1024 ** 3
 
