@@ -174,9 +174,21 @@ def evaluate(
 # ---------------------------------------------------------------------------
 
 
+def _fmt(seconds: float) -> str:
+    """Format elapsed seconds as e.g. '1m23s' or '45s'."""
+    s = int(seconds)
+    return f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
 def run_seed(args, seed: int, run_dir: str) -> str:
     """Train one GRPO run with the given seed. Writes metrics.jsonl + rollouts.jsonl
     into run_dir and returns the metrics path."""
+    import time
+    seed_start = time.perf_counter()
+
+    def elapsed() -> str:
+        return _fmt(time.perf_counter() - seed_start)
+
     print(f"\n===== seed {seed} -> {run_dir} =====")
     set_seed(seed)
     os.makedirs(run_dir, exist_ok=True)
@@ -190,35 +202,53 @@ def run_seed(args, seed: int, run_dir: str) -> str:
     logger = JsonlLogger(metrics_path)
     open(rollouts_path, "w").close()  # truncate
 
-    # --- Load datasets (subsample to the configured train/val sizes) ---
+    # --- Load datasets ---
+    t0 = time.perf_counter()
+    print(f"[seed {seed}][{elapsed()}] loading datasets...")
     train_prompts, train_ground_truths = load_gsm8k(args.train_path, prompt_template)
     test_prompts, test_ground_truths = load_gsm8k(args.test_path, prompt_template)
     train_prompts = train_prompts[: args.n_train_examples]
     train_ground_truths = train_ground_truths[: args.n_train_examples]
     test_prompts = test_prompts[: args.n_val_examples]
     test_ground_truths = test_ground_truths[: args.n_val_examples]
-    print(f"Loaded {len(train_prompts)} train / {len(test_prompts)} val examples.")
+    print(f"[seed {seed}][{elapsed()}] loaded {len(train_prompts)} train / {len(test_prompts)} val examples ({_fmt(time.perf_counter()-t0)})")
 
-    # --- Policy model + optimizer (on the training GPU) ---
+    # --- Policy model + optimizer ---
+    t0 = time.perf_counter()
+    print(f"[seed {seed}][{elapsed()}] loading policy model ({args.model})...")
     model, tokenizer = checkpoint.get_model_and_tokenizer(args.model, device)
+    model.gradient_checkpointing_enable()
+    model.train()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
         weight_decay=0.0,
         betas=(0.9, 0.95),
     )
+    print(f"[seed {seed}][{elapsed()}] policy model loaded ({_fmt(time.perf_counter()-t0)})")
 
-    # --- vLLM inference server (separate GPU) for rollouts + eval ---
-    server = vllm_utils.VLLMServer(
-        model_id=args.model,
-        host="localhost",
-        port=args.vllm_port,
-        gpu=1,
-        seed=seed,
-        gpu_memory_utilization=0.85,
-    )
-    server.start()
-    server.init_weight_sync(policy_device=device)  # NCCL group for weight push
+    # --- vLLM inference server (skipped in debug mode) ---
+    if args.debug_no_vllm:
+        print(f"[seed {seed}][{elapsed()}] [DEBUG] skipping vLLM server and NCCL init")
+        server = None
+    else:
+        t0 = time.perf_counter()
+        print(f"[seed {seed}][{elapsed()}] starting vLLM server on GPU 1 (port {args.vllm_port})...")
+        server = vllm_utils.VLLMServer(
+            model_id=args.model,
+            host="localhost",
+            port=args.vllm_port,
+            gpu=1,
+            seed=seed,
+            gpu_memory_utilization=0.9,
+        )
+        server.start()
+        print(f"[seed {seed}][{elapsed()}] vLLM server ready ({_fmt(time.perf_counter()-t0)})")
+
+        t0 = time.perf_counter()
+        print(f"[seed {seed}][{elapsed()}] initializing NCCL weight sync...")
+        server.init_weight_sync(policy_device=device)
+        print(f"[seed {seed}][{elapsed()}] NCCL ready ({_fmt(time.perf_counter()-t0)})")
 
     rollout_sampling_params = {
         "temperature": args.sampling_temperature,
@@ -237,30 +267,51 @@ def run_seed(args, seed: int, run_dir: str) -> str:
         "include_stop_str_in_output": True,
     }
 
-    # --- Baseline eval before any training (step 0) ---
-    val_metrics = evaluate(server, test_prompts, test_ground_truths, reward_fn, eval_sampling_params)
-    logger.log({"step": 0, **val_metrics})
-    print(f"[seed {seed}][step 0] val: {val_metrics}")
+    # --- Baseline eval (step 0) ---
+    if args.debug_no_vllm:
+        print(f"[seed {seed}][{elapsed()}] [DEBUG] skipping baseline eval")
+    else:
+        t0 = time.perf_counter()
+        print(f"[seed {seed}][{elapsed()}] running baseline eval (step 0)...")
+        val_metrics = evaluate(server, test_prompts, test_ground_truths, reward_fn, eval_sampling_params)
+        logger.log({"step": 0, **val_metrics})
+        print(f"[seed {seed}][{elapsed()}] step 0 val: {val_metrics} ({_fmt(time.perf_counter()-t0)})")
 
     n_prompts_per_step = args.rollout_batch_size // args.group_size
 
+    # Per-phase timing accumulators (seconds).
+    t_rollout = t_update = t_sync = t_eval = 0.0
+
     # --- GRPO training loop ---
+    print(f"[seed {seed}][{elapsed()}] starting GRPO training loop ({args.num_rollout_steps} steps)...")
     for step in range(1, args.num_rollout_steps + 1):
-        # 1) Sample a batch of prompts for this step.
+        step_start = time.perf_counter()
+
+        # 1) Sample a batch of prompts.
         prompt_idxs = random.sample(range(len(train_prompts)), n_prompts_per_step)
         batch_prompts = [train_prompts[i] for i in prompt_idxs]
         batch_ground_truths = [train_ground_truths[i] for i in prompt_idxs]
 
-        # 2) ROLLOUT: group_size responses per prompt, aligned 1:1 (prompt-major).
-        completions = server.generate_completions(batch_prompts, rollout_sampling_params)
-        assert len(completions) == n_prompts_per_step * args.group_size, (
-            f"expected {n_prompts_per_step * args.group_size} completions, got {len(completions)}"
-        )
+        # 2) ROLLOUT.
+        t0 = time.perf_counter()
         repeated_prompts = [p for p in batch_prompts for _ in range(args.group_size)]
         repeated_ground_truths = [gt for gt in batch_ground_truths for _ in range(args.group_size)]
-        rollout_responses = [c.text for c in completions]
+        if args.debug_no_vllm:
+            # Dummy responses: valid format so reward_fn and tokenizer both work.
+            rollout_responses = [
+                "<think>dummy</think><answer>1</answer>"
+                for _ in range(n_prompts_per_step * args.group_size)
+            ]
+        else:
+            completions = server.generate_completions(batch_prompts, rollout_sampling_params)
+            assert len(completions) == n_prompts_per_step * args.group_size, (
+                f"expected {n_prompts_per_step * args.group_size} completions, got {len(completions)}"
+            )
+            rollout_responses = [c.text for c in completions]
+        t_rollout += time.perf_counter() - t0
 
         # 3) POLICY UPDATE.
+        t0 = time.perf_counter()
         loss, train_metadata = sft.grpo_train_step(
             model, tokenizer, optimizer,
             args.gradient_accumulation_steps,
@@ -271,33 +322,64 @@ def run_seed(args, seed: int, run_dir: str) -> str:
             repeated_ground_truths,
             args.group_size,
         )
+        t_update += time.perf_counter() - t0
 
-        # Log train metrics (every step).
+        step_time = time.perf_counter() - step_start
+        train_metadata["step_time"] = step_time
+
         logger.log({"step": step, **train_metadata})
         if step % args.print_interval == 0 or step == 1:
             short = {k: round(v.item() if torch.is_tensor(v) else v, 4)
                      for k, v in train_metadata.items()
                      if k in ("loss", "grad_norm", "token_entropy", "train_reward", "train_format_reward")}
-            print(f"[seed {seed}][step {step}] train: {short}")
+            shape_info = (
+                f"batch={int(train_metadata['batch_size'])}"
+                f" seq={int(train_metadata['padded_seq_len'])}"
+                f" resp_tok={train_metadata['avg_response_tokens']:.1f}"
+                f" peak_mem={train_metadata['peak_mem_gb']:.2f}GB"
+            )
+            print(f"[seed {seed}][{elapsed()}][step {step}/{args.num_rollout_steps}] train: {short} | {shape_info} | step={_fmt(step_time)}")
 
-        # 4) WEIGHT SYNC so the next rollout uses the updated policy.
-        server.sync_policy_weights(model)
+        # 4) WEIGHT SYNC.
+        if not args.debug_no_vllm:
+            t0 = time.perf_counter()
+            server.sync_policy_weights(model)
+            t_sync += time.perf_counter() - t0
 
-        # --- Periodically dump rollouts to read by eye ---
+        # --- Periodic rollout dump ---
         if step % args.rollout_log_interval == 0 or step == args.num_rollout_steps:
             log_rollouts(rollouts_path, step, repeated_prompts, rollout_responses,
                          repeated_ground_truths, reward_fn, args.rollout_log_samples)
 
         # --- Periodic eval ---
-        if step % args.eval_interval == 0 or step == args.num_rollout_steps:
+        if not args.debug_no_vllm and (step % args.eval_interval == 0 or step == args.num_rollout_steps):
+            t0 = time.perf_counter()
+            print(f"[seed {seed}][{elapsed()}][step {step}] running eval...")
             val_metrics = evaluate(server, test_prompts, test_ground_truths, reward_fn, eval_sampling_params)
+            dt_eval = time.perf_counter() - t0
+            t_eval += dt_eval
             logger.log({"step": step, **val_metrics})
-            print(f"[seed {seed}][step {step}] val: {val_metrics}")
+            print(f"[seed {seed}][{elapsed()}][step {step}] val: {val_metrics} ({_fmt(dt_eval)})")
 
-    server.stop()
+    total_time = time.perf_counter() - seed_start
+    print(
+        f"\n[seed {seed}] done in {_fmt(total_time)} | "
+        f"rollout={_fmt(t_rollout)} update={_fmt(t_update)} "
+        f"weight_sync={_fmt(t_sync)} eval={_fmt(t_eval)}"
+    )
+    logger.log({
+        "step": "summary",
+        "total_time_s": total_time,
+        "t_rollout_s": t_rollout,
+        "t_update_s": t_update,
+        "t_weight_sync_s": t_sync,
+        "t_eval_s": t_eval,
+    })
+
+    if server is not None:
+        server.stop()
     logger.close()
 
-    # Free GPU memory before the next seed.
     del model, optimizer
     torch.cuda.empty_cache()
     return metrics_path
@@ -419,7 +501,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="OLMo-2-0425-1B")
+    parser.add_argument("--model", type=str, default="allenai/OLMo-2-0425-1B")
     parser.add_argument("--train-path", type=str, default="data/gsm8k/train.jsonl")
     parser.add_argument("--test-path", type=str, default="data/gsm8k/test.jsonl")
     parser.add_argument("--output-dir", type=str, default="grpo_runs")
@@ -434,11 +516,15 @@ if __name__ == "__main__":
     parser.add_argument("--rollout-batch-size", type=int, default=256)
     parser.add_argument("--train-batch-size", type=int, default=256)
     parser.add_argument("--group-size", type=int, default=8)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
+    # set to 64 instead of 32 to avoid OOM in 5090 gpu
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=64)
     parser.add_argument("--sampling-temperature", type=float, default=1.0)
     parser.add_argument("--sampling-max-tokens", type=int, default=512)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--epochs-per-rollout-batch", type=int, default=1)
+    # Debug
+    parser.add_argument("--debug-no-vllm", action="store_true",
+                        help="Skip vLLM server + NCCL + eval; use dummy rollouts to debug backward/optimizer.")
     # Logging / eval cadence
     parser.add_argument("--eval-interval", type=int, default=10)
     parser.add_argument("--print-interval", type=int, default=1)

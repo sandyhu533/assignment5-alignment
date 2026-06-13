@@ -1,0 +1,28 @@
+{
+  "timestamp": "2026-06-13_03-51-08",
+  "model": "allenai/OLMo-2-0425-1B",
+  "train_path": "data/gsm8k/train.jsonl",
+  "test_path": "data/gsm8k/test.jsonl",
+  "output_dir": "grpo_runs",
+  "vllm_port": 8000,
+  "seeds": [
+    0
+  ],
+  "n_train_examples": 6400,
+  "n_val_examples": 1024,
+  "num_rollout_steps": 1,
+  "learning_rate": 1e-05,
+  "rollout_batch_size": 256,
+  "train_batch_size": 256,
+  "group_size": 8,
+  "gradient_accumulation_steps": 64,
+  "sampling_temperature": 1.0,
+  "sampling_max_tokens": 512,
+  "max_grad_norm": 1.0,
+  "epochs_per_rollout_batch": 1,
+  "debug_no_vllm": false,
+  "eval_interval": 10,
+  "print_interval": 1,
+  "rollout_log_interval": 10,
+  "rollout_log_samples": 8
+}

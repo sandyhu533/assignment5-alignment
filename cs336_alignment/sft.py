@@ -32,15 +32,14 @@ def get_response_log_probs(
     labels: torch.Tensor, # shape (batch_size, sequence_length)
     return_token_entropy: bool = False, # If True, also return per-token entropy
     ) -> dict[str, torch.Tensor]:
-    logits:torch.Tensor = model(input_ids=input_ids).logits # (batch_size, sequence_length, vocab_size)
+    logits: torch.Tensor = model(input_ids=input_ids).logits  # (B, T, V)
     log_probs_all = F.log_softmax(logits, dim=-1)
+    del logits  # free the large (B, T, V) logits tensor before allocating more
     log_probs = torch.gather(log_probs_all, -1, labels.unsqueeze(-1)).squeeze(-1)
-    res = {
-        "log_probs": log_probs
-    }
+    res = {"log_probs": log_probs}
     if return_token_entropy:
-        p = log_probs_all.exp()
-        res["token_entropy"] = -(p * log_probs_all).sum(-1)
+        # entr(x) = -x*ln(x); avoids materializing a second (B,T,V) product tensor
+        res["token_entropy"] = torch.special.entr(log_probs_all.exp()).sum(-1)
     return res
 
 def compute_rollout_rewards(
@@ -176,6 +175,10 @@ def grpo_train_step(
     labels = tok_res["labels"].to(device)
     response_mask = tok_res["response_mask"].to(device)
 
+    batch_size, padded_seq_len = input_ids.shape
+    # Average non-padding tokens per sequence (response portion only).
+    avg_response_tokens = response_mask.float().sum(-1).mean().item()
+
     # Rewards/advantages computed ONCE over the full batch so group normalization
     # always uses complete groups (independent of gradient_accumulation_steps).
     raw_rewards, reward_metadata = compute_rollout_rewards(
@@ -187,9 +190,10 @@ def grpo_train_step(
     advantages = advantages.to(device)
 
     total_loss = torch.zeros((), dtype=torch.float32, device=device)
-    # Accumulate masked token entropy across all microbatches.
     entropy_sum = torch.zeros((), dtype=torch.float32, device=device)
     token_count = torch.zeros((), dtype=torch.float32, device=device)
+
+    torch.cuda.reset_peak_memory_stats(device)
 
     for i in range(0, len(input_ids), microbatch_size):
         input_ids_b = input_ids[i:i+microbatch_size]
@@ -210,8 +214,8 @@ def grpo_train_step(
         total_loss += loss.detach()
         loss.backward()
 
-    # clip_grad_norm_ returns the (pre-clip) total norm; pass inf to measure
-    # without actually clipping when max_grad_norm is None.
+    peak_mem_gb = torch.cuda.max_memory_allocated(device) / 1024 ** 3
+
     clip_value = max_grad_norm if max_grad_norm is not None else float("inf")
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
 
@@ -225,6 +229,11 @@ def grpo_train_step(
         "train_reward": reward_metadata["mean_raw_rewards"],
         "train_format_reward": reward_metadata["mean_format_reward"],
         "train_answer_reward": reward_metadata["mean_answer_reward"],
+        # Tensor shape / memory diagnostics
+        "batch_size": batch_size,
+        "padded_seq_len": padded_seq_len,
+        "avg_response_tokens": avg_response_tokens,
+        "peak_mem_gb": peak_mem_gb,
         **advantage_metadata,
     }
     return total_loss, metadata

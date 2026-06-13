@@ -1,0 +1,2 @@
+{"step": 1, "loss": 0.0, "grad_norm": 0.0, "token_entropy": 2.052283763885498, "train_reward": 0.0, "train_format_reward": 0.0, "train_answer_reward": 0.0, "mean_grouped_advantages": 0.0, "std_grouped_advantages": 0.0, "max_grouped_advantages": 0.0, "min_grouped_advantages": 0.0, "mean_reward": 0.0, "std_reward": 0.0, "max_reward": 0.0, "min_reward": 0.0, "step_time": 5.69036721996963}
+{"step": "summary", "total_time_s": 22.281061124056578, "t_rollout_s": 1.2122094631195068e-05, "t_update_s": 5.690320182591677, "t_weight_sync_s": 0.0, "t_eval_s": 0.0}
