@@ -217,7 +217,6 @@ def run_seed(args, seed: int, run_dir: str) -> str:
     t0 = time.perf_counter()
     print(f"[seed {seed}][{elapsed()}] loading policy model ({args.model})...")
     model, tokenizer = checkpoint.get_model_and_tokenizer(args.model, device)
-    model.gradient_checkpointing_enable()
     model.train()
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -516,8 +515,7 @@ if __name__ == "__main__":
     parser.add_argument("--rollout-batch-size", type=int, default=256)
     parser.add_argument("--train-batch-size", type=int, default=256)
     parser.add_argument("--group-size", type=int, default=8)
-    # set to 64 instead of 32 to avoid OOM in 5090 gpu
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=64)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--sampling-temperature", type=float, default=1.0)
     parser.add_argument("--sampling-max-tokens", type=int, default=512)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)

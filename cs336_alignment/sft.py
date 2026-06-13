@@ -205,7 +205,10 @@ def grpo_train_step(
             old_log_probs_b = old_log_probs[i:i+microbatch_size]
         log_probs_res = get_response_log_probs(model, input_ids_b, labels_b, True)
         log_probs, token_entropy = log_probs_res["log_probs"], log_probs_res["token_entropy"]
-        entropy_sum += (token_entropy * mask_b).sum()
+        # Entropy is logging-only; detach so we don't pin this microbatch's autograd
+        # graph in entropy_sum across the whole accumulation loop (would retain all
+        # gradient_accumulation_steps microbatch graphs at once -> OOM).
+        entropy_sum += (token_entropy.detach() * mask_b).sum()
         token_count += mask_b.sum()
         per_token_loss, _ = compute_policy_gradient_loss(advantages_b, log_probs, importance_reweighting_method, old_log_probs_b, cliprange, mask_b)
         loss = aggregate_loss_across_microbatch(per_token_loss, mask_b, loss_normalization, normalization_constant)
