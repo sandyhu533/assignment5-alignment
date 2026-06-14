@@ -1,0 +1,4 @@
+{"step": 0, "val_reward": 0.001953125, "val_format_reward": 0.982421875, "val_avg_response_length": 67.6357421875}
+{"step": 1, "loss": 0.0, "grad_norm": 0.0, "token_entropy": 0.9776034355163574, "train_reward": 0.0, "train_format_reward": 0.56640625, "train_answer_reward": 0.0, "batch_size": 256, "padded_seq_len": 737, "avg_response_tokens": 109.53125, "peak_mem_gb": 23.81786012649536, "mean_grouped_advantages": 0.0, "std_grouped_advantages": 0.0, "max_grouped_advantages": 0.0, "min_grouped_advantages": 0.0, "mean_reward": 0.0, "std_reward": 0.0, "max_reward": 0.0, "min_reward": 0.0, "step_time": 14.830907765775919}
+{"step": 1, "val_reward": 0.001953125, "val_format_reward": 0.982421875, "val_avg_response_length": 67.6357421875}
+{"step": "summary", "total_time_s": 431.117769734934, "t_rollout_s": 2.1351505871862173, "t_update_s": 12.695716050453484, "t_weight_sync_s": 0.24721653014421463, "t_eval_s": 6.613976706750691}

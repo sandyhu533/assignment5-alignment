@@ -6,24 +6,44 @@ import sys
 from datetime import datetime
 from typing import Callable
 
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 
 from cs336_alignment import checkpoint
 from cs336_alignment import vllm_utils
-from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
 from cs336_alignment import sft
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
-# r1_zero prompt: forces <think> ... </think> <answer> ... </answer> formatting.
-R1_ZERO_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "r1_zero.prompt")
+PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "prompts")
+
+# Each prompt maps to its template file and the reward fn that grades its outputs.
+# r1_zero / r1_zero_three_shot both emit <think>..</think> <answer>..</answer>, so
+# they share r1_zero_reward_fn; question_only emits a bare answer (question_only_reward_fn).
+PROMPT_REGISTRY = {
+    "r1_zero": ("r1_zero.prompt", r1_zero_reward_fn),
+    "r1_zero_three_shot": ("r1_zero_three_shot_gsm8k.prompt", r1_zero_reward_fn),
+    "question_only": ("question_only.prompt", question_only_reward_fn),
+}
+
+R1_ZERO_PROMPT_PATH = os.path.join(PROMPTS_DIR, "r1_zero.prompt")
 
 
 def load_prompt_template(path: str = R1_ZERO_PROMPT_PATH) -> str:
     with open(path) as f:
         return f.read()
+
+
+def resolve_prompt(name: str):
+    """Return (prompt_template_str, reward_fn) for a registered prompt name."""
+    if name not in PROMPT_REGISTRY:
+        raise ValueError(f"unknown prompt {name!r}; choices: {list(PROMPT_REGISTRY)}")
+    filename, reward_fn = PROMPT_REGISTRY[name]
+    return load_prompt_template(os.path.join(PROMPTS_DIR, filename)), reward_fn
 
 
 def extract_gsm8k_answer(answer_field: str) -> str:
@@ -119,19 +139,34 @@ def log_rollouts(
     reward_fn: Callable[[str, str], dict[str, float]],
     n_samples: int,
 ) -> None:
-    """Append a few (prompt, response, reward) rollouts so we can read them by eye."""
+    """Append rollouts to jsonl: first n_samples in order, plus top n_samples by reward."""
+    scored = []
+    for prompt, response, gt in zip(prompts, responses, ground_truths):
+        scores = reward_fn(response, gt)
+        scored.append({
+            "step": step,
+            "prompt": prompt,
+            "response": response,
+            "ground_truth": gt,
+            "reward": scores["reward"],
+            "format_reward": scores["format_reward"],
+            "answer_reward": scores["answer_reward"],
+        })
+
+    # Random n_samples + top n_samples by reward (deduped, marked separately).
+    rand_idxs = set(random.sample(range(len(scored)), min(n_samples, len(scored))))
+    top_idxs = sorted(range(len(scored)), key=lambda i: scored[i]["reward"], reverse=True)[:n_samples]
+
+    entries = []
+    for i in rand_idxs:
+        entries.append(scored[i] | {"sample_type": "random"})
+    for i in top_idxs:
+        if i not in rand_idxs:
+            entries.append(scored[i] | {"sample_type": "top_reward"})
+
     with open(path, "a") as fh:
-        for prompt, response, gt in zip(prompts[:n_samples], responses[:n_samples], ground_truths[:n_samples]):
-            scores = reward_fn(response, gt)
-            fh.write(json.dumps({
-                "step": step,
-                "prompt": prompt,
-                "response": response,
-                "ground_truth": gt,
-                "reward": scores["reward"],
-                "format_reward": scores["format_reward"],
-                "answer_reward": scores["answer_reward"],
-            }) + "\n")
+        for entry in entries:
+            fh.write(json.dumps(entry) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +229,16 @@ def run_seed(args, seed: int, run_dir: str) -> str:
     os.makedirs(run_dir, exist_ok=True)
 
     device = "cuda:0"
-    prompt_template = load_prompt_template()
-    reward_fn = r1_zero_reward_fn
+    prompt_template, reward_fn = resolve_prompt(args.prompt)
+
+    # For constant loss normalization (Dr.GRPO/RFT/MaxRL/GRPO_constant), divide the
+    # total loss by Z = B*G*L (rollout_batch_size * max generation length) per the
+    # handout. Sequence normalization ignores this (passes None).
+    normalization_constant = (
+        args.rollout_batch_size * args.sampling_max_tokens
+        if args.loss_normalization == "constant"
+        else None
+    )
 
     metrics_path = os.path.join(run_dir, "metrics.jsonl")
     rollouts_path = os.path.join(run_dir, "rollouts.jsonl")
@@ -239,7 +282,8 @@ def run_seed(args, seed: int, run_dir: str) -> str:
             port=args.vllm_port,
             gpu=1,
             seed=seed,
-            gpu_memory_utilization=0.9,
+            gpu_memory_utilization=0.85,
+            vllm_log_path=os.path.join(run_dir, "vllm.log"),
         )
         server.start()
         print(f"[seed {seed}][{elapsed()}] vLLM server ready ({_fmt(time.perf_counter()-t0)})")
@@ -325,6 +369,10 @@ def run_seed(args, seed: int, run_dir: str) -> str:
                 rollout_responses,
                 repeated_ground_truths,
                 args.group_size,
+                baseline=args.baseline,
+                advantage_normalizer=args.advantage_normalizer,
+                loss_normalization=args.loss_normalization,
+                normalization_constant=normalization_constant,
                 debug_memory=args.debug_memory,
             )
         except torch.cuda.OutOfMemoryError:
@@ -338,7 +386,7 @@ def run_seed(args, seed: int, run_dir: str) -> str:
         t_update += time.perf_counter() - t0
 
         step_time = time.perf_counter() - step_start
-        train_metadata["step_time"] = step_time
+        train_metadata["step_time"] = round(step_time, 2)
 
         logger.log({"step": step, **train_metadata})
         if step % args.print_interval == 0 or step == 1:
@@ -360,7 +408,7 @@ def run_seed(args, seed: int, run_dir: str) -> str:
             t_sync += time.perf_counter() - t0
 
         # --- Periodic rollout dump ---
-        if step % args.rollout_log_interval == 0 or step == args.num_rollout_steps:
+        if step == 1 or step % args.rollout_log_interval == 0 or step == args.num_rollout_steps:
             log_rollouts(rollouts_path, step, repeated_prompts, rollout_responses,
                          repeated_ground_truths, reward_fn, args.rollout_log_samples)
 
@@ -382,11 +430,11 @@ def run_seed(args, seed: int, run_dir: str) -> str:
     )
     logger.log({
         "step": "summary",
-        "total_time_s": total_time,
-        "t_rollout_s": t_rollout,
-        "t_update_s": t_update,
-        "t_weight_sync_s": t_sync,
-        "t_eval_s": t_eval,
+        "total_time_s": round(total_time, 2),
+        "t_rollout_s": round(t_rollout, 2),
+        "t_update_s": round(t_update, 2),
+        "t_weight_sync_s": round(t_sync, 2),
+        "t_eval_s": round(t_eval, 2),
     })
 
     if args.debug_memory:
@@ -508,8 +556,14 @@ def main(args):
         for seed in args.seeds:
             seed_dir = os.path.join(run_root, f"seed_{seed}")
             metrics_paths.append(run_seed(args, seed, seed_dir))
-        aggregate_and_plot(metrics_paths, run_root)
+            # Refresh plots after every completed seed so partial results are
+            # visible mid-run (n grows from 1 up to len(seeds)).
+            aggregate_and_plot(metrics_paths, run_root)
         print(f"\nDone. Per-seed metrics + rollouts under {run_root}/seed_*/, plots in {run_root}/plots/")
+    except Exception:
+        import traceback
+        traceback.print_exc()  # printed while sys.stderr is still Tee'd into run.log
+        raise
     finally:
         sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
         log_fh.close()
@@ -532,11 +586,20 @@ if __name__ == "__main__":
     parser.add_argument("--rollout-batch-size", type=int, default=256)
     parser.add_argument("--train-batch-size", type=int, default=256)
     parser.add_argument("--group-size", type=int, default=8)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=64)
     parser.add_argument("--sampling-temperature", type=float, default=1.0)
     parser.add_argument("--sampling-max-tokens", type=int, default=512)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--epochs-per-rollout-batch", type=int, default=1)
+    # Prompt + RL algorithm variant knobs (default = standard on-policy GRPO)
+    parser.add_argument("--prompt", type=str, default="r1_zero",
+                        choices=["r1_zero", "r1_zero_three_shot", "question_only"])
+    parser.add_argument("--baseline", type=str, default="mean",
+                        choices=["mean", "none"])
+    parser.add_argument("--advantage-normalizer", type=str, default="std",
+                        choices=["std", "none", "mean"])
+    parser.add_argument("--loss-normalization", type=str, default="sequence",
+                        choices=["sequence", "constant"])
     # Debug
     parser.add_argument("--debug-no-vllm", action="store_true",
                         help="Skip vLLM server + NCCL + eval; use dummy rollouts to debug backward/optimizer.")

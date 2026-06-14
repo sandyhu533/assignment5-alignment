@@ -38,8 +38,9 @@ def get_response_log_probs(
     log_probs = torch.gather(log_probs_all, -1, labels.unsqueeze(-1)).squeeze(-1)
     res = {"log_probs": log_probs}
     if return_token_entropy:
-        # entr(x) = -x*ln(x); avoids materializing a second (B,T,V) product tensor
-        res["token_entropy"] = torch.special.entr(log_probs_all.exp()).sum(-1)
+        with torch.no_grad():
+            # entr(x) = -x*ln(x); avoids materializing a second (B,T,V) product tensor
+            res["token_entropy"] = torch.special.entr(log_probs_all.exp()).sum(-1)
     return res
 
 def compute_rollout_rewards(
@@ -87,14 +88,14 @@ def compute_group_normalized_rewards(
         advantage_val = group_rewards.std(dim=-1, keepdim=True)+advantage_eps
     advantages = ((group_rewards-baseline_val)/advantage_val).reshape(batch_size,)
     metadata = {
-        "mean_grouped_advantages": advantages.mean(),
-        "std_grouped_advantages": advantages.std(),
-        "max_grouped_advantages": advantages.max(),
-        "min_grouped_advantages": advantages.min(),
-        "mean_reward": raw_rewards.mean(),
-        "std_reward": raw_rewards.std(),
-        "max_reward": raw_rewards.max(),
-        "min_reward": raw_rewards.min(),
+        "mean_grouped_advantages": advantages.mean().detach(),
+        "std_grouped_advantages": advantages.std().detach(),
+        "max_grouped_advantages": advantages.max().detach(),
+        "min_grouped_advantages": advantages.min().detach(),
+        "mean_reward": raw_rewards.mean().detach(),
+        "std_reward": raw_rewards.std().detach(),
+        "max_reward": raw_rewards.max().detach(),
+        "min_reward": raw_rewards.min().detach(),
     }
     return advantages, raw_rewards, metadata
 
@@ -118,6 +119,10 @@ def compute_policy_gradient_loss(
         clipped = reweight.clip(1-cliprange, 1+cliprange)
         per_token_loss = torch.minimum(reweight*raw_rewards_or_advantages,
                                        clipped*raw_rewards_or_advantages)
+        # clip fraction: masked tokens whose importance weight got clipped.
+        with torch.no_grad():
+            was_clipped = (reweight < 1-cliprange) | (reweight > 1+cliprange)
+            metadata["clipped_tokens"] = (was_clipped & response_mask.bool()).sum().detach()
         return -per_token_loss, metadata
     else: # gspo
         log_ratio = policy_log_probs-old_log_probs
@@ -126,6 +131,10 @@ def compute_policy_gradient_loss(
         clipped = reweight.clip(1-cliprange, 1+cliprange)
         per_token_loss = torch.minimum(reweight*raw_rewards_or_advantages,
                                        clipped*raw_rewards_or_advantages).expand_as(log_ratio)
+        # Sequence-level reweight; a clipped sequence counts all its masked tokens.
+        with torch.no_grad():
+            was_clipped = (reweight < 1-cliprange) | (reweight > 1+cliprange)  # (B,1)
+            metadata["clipped_tokens"] = (was_clipped & response_mask.bool()).sum().detach()
         return -per_token_loss, metadata
 
 def aggregate_loss_across_microbatch(
@@ -180,6 +189,9 @@ def grpo_train_step(
     batch_size, padded_seq_len = input_ids.shape
     # Average non-padding tokens per sequence (response portion only).
     avg_response_tokens = response_mask.float().sum(-1).mean().item()
+    
+    if old_log_probs is not None:
+        old_log_probs = old_log_probs[:, :padded_seq_len]
 
     # Rewards/advantages computed ONCE over the full batch so group normalization
     # always uses complete groups (independent of gradient_accumulation_steps).
@@ -194,6 +206,7 @@ def grpo_train_step(
     total_loss = torch.zeros((), dtype=torch.float32, device=device)
     entropy_sum = torch.zeros((), dtype=torch.float32, device=device)
     token_count = torch.zeros((), dtype=torch.float32, device=device)
+    clip_token_sum = torch.zeros((), dtype=torch.float32, device=device)
 
     torch.cuda.reset_peak_memory_stats(device)
 
@@ -202,6 +215,10 @@ def grpo_train_step(
         labels_b = labels[i:i+microbatch_size]
         mask_b = response_mask[i:i+microbatch_size]
         advantages_b = advantages[i:i+microbatch_size]
+        # All-zero advantages contribute zero gradient (e.g. std-normalized group
+        # with identical rewards); skip the forward/backward for this microbatch.
+        if not advantages_b.any():
+            continue
         old_log_probs_b = None
         if old_log_probs is not None:
             old_log_probs_b = old_log_probs[i:i+microbatch_size]
@@ -212,23 +229,30 @@ def grpo_train_step(
         # gradient_accumulation_steps microbatch graphs at once -> OOM).
         entropy_sum += (token_entropy.detach() * mask_b).sum()
         token_count += mask_b.sum()
-        per_token_loss, _ = compute_policy_gradient_loss(advantages_b, log_probs, importance_reweighting_method, old_log_probs_b, cliprange, mask_b)
+        per_token_loss, pg_meta = compute_policy_gradient_loss(advantages_b, log_probs, importance_reweighting_method, old_log_probs_b, cliprange, mask_b)
+        clip_token_sum += pg_meta.get("clipped_tokens", 0)
         loss = aggregate_loss_across_microbatch(per_token_loss, mask_b, loss_normalization, normalization_constant)
         if loss_normalization == "sequence":
             loss *= (len(input_ids_b) / len(input_ids))
         total_loss += loss.detach()
+
+        # Pre-backward alloc captures the forward peak (logits + activations still
+        # resident); post-backward alloc shows the flat baseline once activations free.
+        pre_bw_alloc = torch.cuda.memory_allocated(device) / 1024 ** 3
+
         loss.backward()
 
         if debug_memory:
-            # Healthy: alloc stays flat across microbatches. Monotonic climb =>
+            # Healthy: post-bw alloc stays flat across microbatches. Monotonic climb =>
             # something is retaining the per-microbatch autograd graph (a leak).
             mb_idx = i // microbatch_size
             print(
-                f"    [mb {mb_idx}] alloc={torch.cuda.memory_allocated(device)/1024**3:.2f}GB "
+                f"    [mb {mb_idx}] pre_bw_alloc={pre_bw_alloc:.2f}GB "
+                f"post_bw_alloc={torch.cuda.memory_allocated(device)/1024**3:.2f}GB "
                 f"reserved={torch.cuda.memory_reserved(device)/1024**3:.2f}GB"
             )
 
-    peak_mem_gb = torch.cuda.max_memory_allocated(device) / 1024 ** 3
+    peak_mem_gb = round(torch.cuda.max_memory_allocated(device) / 1024 ** 3, 2)
 
     clip_value = max_grad_norm if max_grad_norm is not None else float("inf")
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
@@ -239,7 +263,8 @@ def grpo_train_step(
     metadata = {
         "loss": total_loss,
         "grad_norm": grad_norm,
-        "token_entropy": entropy_sum / token_count,
+        "token_entropy": entropy_sum / token_count.clamp(min=1),
+        "clip_fraction": (clip_token_sum / token_count.clamp(min=1)),
         "train_reward": reward_metadata["mean_raw_rewards"],
         "train_format_reward": reward_metadata["mean_format_reward"],
         "train_answer_reward": reward_metadata["mean_answer_reward"],

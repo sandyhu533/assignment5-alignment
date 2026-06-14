@@ -38,6 +38,7 @@ class VLLMServer:
     launch_server: bool = True
     startup_timeout: int = 600
     shutdown_timeout: int = 30
+    vllm_log_path: str | None = None
 
     def __post_init__(self) -> None:
         self.base_url = f"http://{self.host}:{self.port}"
@@ -56,6 +57,7 @@ class VLLMServer:
                 load_format=self.load_format,
                 logging_level=self.logging_level,
                 gpu_memory_utilization=self.gpu_memory_utilization,
+                vllm_log_path=self.vllm_log_path,
             )
             atexit.register(self.stop)
         wait_for_server(self.base_url, self.process, self.startup_timeout)
@@ -122,6 +124,7 @@ def start_server(
     load_format: str,
     logging_level: str,
     gpu_memory_utilization: float = 0.9,
+    vllm_log_path: str | None = None,
 ) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -150,7 +153,9 @@ def start_server(
         load_format,
     ]
     logger.info("Starting vLLM server: %s", " ".join(command))
-    return subprocess.Popen(command, env=env, start_new_session=True)
+    log_fh = open(vllm_log_path, "w") if vllm_log_path else None
+    return subprocess.Popen(command, env=env, start_new_session=True,
+                            stdout=log_fh, stderr=log_fh)
 
 
 def wait_for_server(base_url: str, process: subprocess.Popen | None, timeout: int) -> None:
