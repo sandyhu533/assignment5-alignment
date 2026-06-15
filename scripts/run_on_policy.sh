@@ -58,33 +58,33 @@ run () {
 
 # === 1. Standard on-policy GRPO (4 seeds, default lr=1e-5, r1_zero) ==========
 # This is the >=25% deliverable AND the baseline reused by exp 2 & 3.
-run "standard_grpo (4 seeds)" "standard" \
-  --seeds 0 1 2 3 \
-  --learning-rate 1e-5 \
-  --prompt r1_zero \
-  --baseline mean --advantage-normalizer std --loss-normalization sequence
+# run "standard_grpo (4 seeds)" "standard" \
+#   --seeds 0 1 2 3 \
+#   --learning-rate 1e-5 \
+#   --prompt r1_zero \
+#   --baseline mean --advantage-normalizer std --loss-normalization sequence
 
-# === 2. Learning-rate sweep (1 seed each; default point reused from exp 1) ===
-run "lr_3e-6" "lr_sweep/lr_3e-6" \
-  --seeds 0 --learning-rate 3e-6 \
-  --prompt r1_zero \
-  --baseline mean --advantage-normalizer std --loss-normalization sequence
+# # === 2. Learning-rate sweep (1 seed each; default point reused from exp 1) ===
+# run "lr_3e-6" "lr_sweep/lr_3e-6" \
+#   --seeds 0 --learning-rate 3e-6 \
+#   --prompt r1_zero \
+#   --baseline mean --advantage-normalizer std --loss-normalization sequence
 
-run "lr_3e-5" "lr_sweep/lr_3e-5" \
-  --seeds 0 --learning-rate 3e-5 \
-  --prompt r1_zero \
-  --baseline mean --advantage-normalizer std --loss-normalization sequence
+# run "lr_3e-5" "lr_sweep/lr_3e-5" \
+#   --seeds 0 --learning-rate 3e-5 \
+#   --prompt r1_zero \
+#   --baseline mean --advantage-normalizer std --loss-normalization sequence
 
-# === 3. Prompt ablation (1 seed each; r1_zero baseline reused from exp 1) ====
-run "prompt_question_only" "prompt/question_only" \
-  --seeds 0 --learning-rate 1e-5 \
-  --prompt question_only \
-  --baseline mean --advantage-normalizer std --loss-normalization sequence
+# # === 3. Prompt ablation (1 seed each; r1_zero baseline reused from exp 1) ====
+# run "prompt_question_only" "prompt/question_only" \
+#   --seeds 0 --learning-rate 1e-5 \
+#   --prompt question_only \
+#   --baseline mean --advantage-normalizer std --loss-normalization sequence
 
-run "prompt_r1_zero_three_shot" "prompt/r1_zero_three_shot" \
-  --seeds 0 --learning-rate 1e-5 \
-  --prompt r1_zero_three_shot \
-  --baseline mean --advantage-normalizer std --loss-normalization sequence
+# run "prompt_r1_zero_three_shot" "prompt/r1_zero_three_shot" \
+#   --seeds 0 --learning-rate 1e-5 \
+#   --prompt r1_zero_three_shot \
+#   --baseline mean --advantage-normalizer std --loss-normalization sequence
 
 # === 4. RL algorithm variants (1 seed each; r1_zero, default lr) =============
 # GRPO_constant: mean / std  / constant

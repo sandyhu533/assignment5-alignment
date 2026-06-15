@@ -1,0 +1,16 @@
+group,experiment,final_val_reward,best_val_reward,final_val_format,final_train_reward,best_train_reward,final_val_resp_len,last_step,run
+onpolicy_variants,GRPO (baseline),0.479,0.479,0.9385,0.4609,0.5898,143.1,100,onpolicy/standard/2026-06-14_05-58-54
+onpolicy_variants,Dr_GRPO,0.4824,0.4824,0.9639,0.4102,0.5938,129.4,100,onpolicy/variants/Dr_GRPO/2026-06-14_22-07-48
+onpolicy_variants,GRPO_constant,0.4365,0.4521,0.9404,0.4062,0.6094,108.0,100,onpolicy/variants/GRPO_constant/2026-06-14_21-49-05
+onpolicy_variants,MaxRL,0.4668,0.4727,0.9775,0.3555,0.5547,124.7,100,onpolicy/variants/MaxRL/2026-06-14_22-43-41
+onpolicy_variants,RFT,0.4316,0.4316,0.9775,0.2461,0.4609,120.8,100,onpolicy/variants/RFT/2026-06-14_22-26-16
+onpolicy_lr_sweep,lr 3e-6,0.0195,0.0195,0.9775,0.0039,0.0156,63.7,100,onpolicy/lr_sweep/lr_3e-6/2026-06-14_06-38-25
+onpolicy_lr_sweep,lr 1e-5 (default),0.479,0.479,0.9385,0.4609,0.5898,143.1,100,onpolicy/standard/2026-06-14_05-58-54
+onpolicy_lr_sweep,lr 3e-5,0.0029,0.3408,0.1094,0.0,0.4844,458.5,80,onpolicy/lr_sweep/lr_3e-5/2026-06-14_06-50-29
+onpolicy_prompt,question_only,0.0,0.0,0.0,0.0,0.0078,512.0,100,onpolicy/prompt/question_only/2026-06-14_07-07-00
+onpolicy_prompt,r1_zero (default),0.479,0.479,0.9385,0.4609,0.5898,143.1,100,onpolicy/standard/2026-06-14_05-58-54
+onpolicy_prompt,r1_zero_three_shot,0.5137,0.5166,0.9736,0.4102,0.6367,120.0,100,onpolicy/prompt/r1_zero_three_shot/2026-06-14_07-26-04
+offpolicy,naive,0.4873,0.5,0.9805,0.4492,0.6484,182.6,100,offpolicy/naive/2026-06-14_23-06-02
+offpolicy,noclip,0.501,0.501,0.9189,0.4219,0.5742,146.5,100,offpolicy/noclip/2026-06-14_23-29-17
+offpolicy,clip,0.4648,0.5098,0.834,0.375,0.6055,108.1,100,offpolicy/clip/2026-06-14_23-51-35
+offpolicy,gspo,0.5059,0.5059,0.9863,0.4023,0.5977,123.5,100,offpolicy/gspo/2026-06-15_00-12-35

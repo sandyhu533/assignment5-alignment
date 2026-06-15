@@ -6,10 +6,10 @@
 # 32 sequential gradient updates, so the policy drifts from the sampling policy
 # and importance reweighting / clipping kicks in.
 #
-#   1. offpolicy_naive   importance_reweighting_method=none    (4 seeds)
-#   2. offpolicy_noclip  importance_reweighting_method=noclip  (4 seeds)
-#   3. offpolicy_clip    importance_reweighting_method=grpo,  cliprange=0.2   (4 seeds)
-#   4. offpolicy_gspo    importance_reweighting_method=gspo,  cliprange=3e-4  (4 seeds)
+#   1. offpolicy_naive   importance_reweighting_method=none    (1 seed)
+#   2. offpolicy_noclip  importance_reweighting_method=noclip  (1 seed)
+#   3. offpolicy_clip    importance_reweighting_method=grpo,  cliprange=0.2   (1 seed)
+#   4. offpolicy_gspo    importance_reweighting_method=gspo,  cliprange=3e-4  (1 seed)
 #
 # Hyperparameters are kept fixed w.r.t. the standard on-policy GRPO runs
 # (r1_zero prompt, baseline=mean, advantage-normalizer=std,
@@ -76,23 +76,23 @@ run () {
 }
 
 # === 1. offpolicy_naive — no importance reweighting (biased; the baseline) ===
-run "offpolicy_naive (4 seeds)" "naive" \
-  --seeds 0 1 2 3 \
+run "offpolicy_naive (1 seed)" "naive" \
+  --seeds 0 \
   --importance-reweighting-method none
 
 # === 2. offpolicy_noclip — token-level importance weights, no clipping =======
-run "offpolicy_noclip (4 seeds)" "noclip" \
-  --seeds 0 1 2 3 \
+run "offpolicy_noclip (1 seed)" "noclip" \
+  --seeds 0 \
   --importance-reweighting-method noclip
 
 # === 3. offpolicy_clip — GRPO/PPO token-level clipping (cliprange 0.2) =======
-run "offpolicy_clip (4 seeds)" "clip" \
-  --seeds 0 1 2 3 \
+run "offpolicy_clip (1 seed)" "clip" \
+  --seeds 0 \
   --importance-reweighting-method grpo --cliprange 0.2
 
 # === 4. offpolicy_gspo — GSPO sequence-level clipping (cliprange 3e-4) =======
-run "offpolicy_gspo (4 seeds)" "gspo" \
-  --seeds 0 1 2 3 \
+run "offpolicy_gspo (1 seed)" "gspo" \
+  --seeds 0 \
   --importance-reweighting-method gspo --cliprange 3e-4
 
 # ---- summary ---------------------------------------------------------------
